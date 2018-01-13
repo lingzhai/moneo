@@ -3,8 +3,6 @@ var neo4j = require("neo4j");
 var async = require("async");
 var util = require("util");
 
-mongoose.Promise = global.Promise;
-
 module.exports = function (neo4jOptions) {
     neo4jOptions = neo4jOptions || {};
     neo4jOptions.url = neo4jOptions.url || 'http://localhost:7474';
@@ -151,125 +149,132 @@ module.exports = function (neo4jOptions) {
             return pathPrefix(path1) === pathPrefix(path2);
         }
 
+        function synchronize(doc,next) {
+
+              var properties = getProperties();
+
+              function findSimpleRefs() {
+                  return properties.filter(function (prop) {
+                      return !!prop.options.ref;
+                  }).map(function (prop) {
+                      var props = properties.filter(function (prop1) {
+                          return samePrefix(prop.path, prop1.path) && prop.path !== prop1.path && pathPrefix(prop.path) !== '';
+                      }).map(function (prop) {
+                          return prop.path;
+                      }).reduce(function (obj, prop) {
+                          obj[pathName(prop)] = doc.get(prop);
+                          return obj;
+                      }, {});
+                      return {
+                          name: prop.options.relName || "Relation",
+                          props: props,
+                          value: doc.get(prop.path)
+                      };
+                  });
+              }
+
+              function findArrayRefs() {
+                  return properties.filter(function (prop) {
+                      return (prop.options.type instanceof Array && !!prop.options.type[0].ref)
+                  }).map(function (prop) {
+                      var values = doc.get(prop.path).map(function (value) {
+                          return {
+                              props: {},
+                              value: value
+                          };
+                      }).filter(function (ref) {
+                          return ref.value !== null && typeof ref.value !== 'undefined';
+                      });
+
+                      return {
+                          name: prop.options.type[0].relName || "Relation",
+                          value: values,
+                          isArray: true
+                      };
+                  });
+              }
+
+              function findNestedArrayRefs() {
+                  return properties.filter(function (prop) {
+                      return (prop.options.type instanceof Array && Object.keys(prop.options.type[0]).some(function (key) {
+                          var type = prop.options.type[0][key];
+                          //console.log('type ',type);
+                          //if(typeof type.ref !== 'undefined')
+                            return !!type.ref;
+                      }))
+                  }).map(function (prop) {
+                      var nestedType = prop.options.type[0];
+                      var nestedTypeProps = Object.keys(nestedType).map(function (key) {
+                          return {path: key, type: prop.options.type[0][key]};
+                      });
+                      var relProp = nestedTypeProps.filter(function (nProp) {
+                          return !!nProp.type.ref;
+                      })[0];
+
+                      var values = doc.get(prop.path).map(function (value) {
+                          return {
+                              props: nestedTypeProps.filter(function (nProp) {
+                                  return nProp !== relProp;
+                              }).reduce(function (obj, nProp) {
+                                  obj[nProp.path] = value[nProp.path];
+                                  return obj;
+                              }, {}),
+                              value: value[relProp.path]
+                          };
+                      }).filter(function (ref) {
+                          return ref.value !== null && typeof ref.value !== 'undefined';
+                      });
+
+                      return {
+                          name: relProp.type.relName || "Relation",
+                          value: values,
+                          isArray: true
+                      };
+                  });
+              }
+
+              async.series([
+                  function (next) {
+                      //Merge node with params:
+                      var docProps = properties.filter(function (prop) {
+                          return !!prop.options.nodeProperty;
+                      }).map(function (prop) {
+                          return prop.path;
+                      }).reduce(function (obj, prop) {
+                          obj[pathName(prop)] = doc.get(prop);
+                          return obj;
+                      }, {});
+                      createNode(doc.constructor.modelName, doc._id, doc.constructor.collection.name, doc.constructor.modelName, docProps, next);
+                  },
+                  function (next) {
+                      //Merge relations:
+
+                      var refs = findSimpleRefs();
+                      refs = refs.concat(findArrayRefs());
+                      //refs = refs.concat(findNestedArrayRefs());
+                      refs = refs.filter(function (ref) {
+                          return ref.value !== null && typeof ref.value !== 'undefined';
+                      });
+
+                      async.mapSeries(refs, function (ref, next) {
+                          if (ref.isArray) {
+                              var value = ref.value;
+                              async.mapSeries(value, function (v, next) {
+                                  var id = v.value instanceof mongoose.Types.ObjectId ? v.value : v.value._id;
+                                  createRelation(ref.name, doc._id, id, v.props, next);
+                              }, next);
+                          }
+                          else {
+                              var id = ref.value instanceof mongoose.Types.ObjectId ? ref.value : ref.value._id;
+                              createRelation(ref.name, doc._id, id, ref.props, next);
+                          }
+                      }, next);
+                  }
+              ], next);
+        }
+
         schema.post('save', function (doc, next) {
-            var properties = getProperties();
-
-            function findSimpleRefs() {
-                return properties.filter(function (prop) {
-                    return !!prop.options.ref;
-                }).map(function (prop) {
-                    var props = properties.filter(function (prop1) {
-                        return samePrefix(prop.path, prop1.path) && prop.path !== prop1.path && pathPrefix(prop.path) !== '';
-                    }).map(function (prop) {
-                        return prop.path;
-                    }).reduce(function (obj, prop) {
-                        obj[pathName(prop)] = doc.get(prop);
-                        return obj;
-                    }, {});
-                    return {
-                        name: prop.options.relName || "Relation",
-                        props: props,
-                        value: doc.get(prop.path)
-                    };
-                });
-            }
-
-            function findArrayRefs() {
-                return properties.filter(function (prop) {
-                    return (prop.options.type instanceof Array && !!prop.options.type[0].ref)
-                }).map(function (prop) {
-                    var values = doc.get(prop.path).map(function (value) {
-                        return {
-                            props: {},
-                            value: value
-                        };
-                    }).filter(function (ref) {
-                        return ref.value !== null && typeof ref.value !== 'undefined';
-                    });
-
-                    return {
-                        name: prop.options.type[0].relName || "Relation",
-                        value: values,
-                        isArray: true
-                    };
-                });
-            }
-
-            function findNestedArrayRefs() {
-                return properties.filter(function (prop) {
-                    return (prop.options.type instanceof Array && Object.keys(prop.options.type[0]).some(function (key) {
-                        var type = prop.options.type[0][key];
-                        return !!type.ref;
-                    }))
-                }).map(function (prop) {
-                    var nestedType = prop.options.type[0];
-                    var nestedTypeProps = Object.keys(nestedType).map(function (key) {
-                        return {path: key, type: prop.options.type[0][key]};
-                    });
-                    var relProp = nestedTypeProps.filter(function (nProp) {
-                        return !!nProp.type.ref;
-                    })[0];
-
-                    var values = doc.get(prop.path).map(function (value) {
-                        return {
-                            props: nestedTypeProps.filter(function (nProp) {
-                                return nProp !== relProp;
-                            }).reduce(function (obj, nProp) {
-                                obj[nProp.path] = value[nProp.path];
-                                return obj;
-                            }, {}),
-                            value: value[relProp.path]
-                        };
-                    }).filter(function (ref) {
-                        return ref.value !== null && typeof ref.value !== 'undefined';
-                    });
-
-                    return {
-                        name: relProp.type.relName || "Relation",
-                        value: values,
-                        isArray: true
-                    };
-                });
-            }
-
-            async.series([
-                function (next) {
-                    //Merge node with params:
-                    var docProps = properties.filter(function (prop) {
-                        return !!prop.options.nodeProperty;
-                    }).map(function (prop) {
-                        return prop.path;
-                    }).reduce(function (obj, prop) {
-                        obj[pathName(prop)] = doc.get(prop);
-                        return obj;
-                    }, {});
-                    createNode(doc.constructor.modelName, doc._id, doc.constructor.collection.name, doc.constructor.modelName, docProps, next);
-                },
-                function (next) {
-                    //Merge relations:
-
-                    var refs = findSimpleRefs();
-                    refs = refs.concat(findArrayRefs());
-                    refs = refs.concat(findNestedArrayRefs());
-                    refs = refs.filter(function (ref) {
-                        return ref.value !== null && typeof ref.value !== 'undefined';
-                    });
-
-                    async.mapSeries(refs, function (ref, next) {
-                        if (ref.isArray) {
-                            var value = ref.value;
-                            async.mapSeries(value, function (v, next) {
-                                var id = v.value instanceof mongoose.Types.ObjectId ? v.value : v.value._id;
-                                createRelation(ref.name, doc._id, id, v.props, next);
-                            }, next);
-                        }
-                        else {
-                            var id = ref.value instanceof mongoose.Types.ObjectId ? ref.value : ref.value._id;
-                            createRelation(ref.name, doc._id, id, ref.props, next);
-                        }
-                    }, next);
-                }
-            ], next);
+          synchronize(doc,next);
         });
 
         schema.pre('insert', function (next) {
@@ -280,10 +285,19 @@ module.exports = function (neo4jOptions) {
         });
 
         schema.pre('update', function (next) {
+            this._neo4j = true;
             next();
         });
         schema.post('update', function (doc, next) {
+            synchronize(doc,next);
+        });
+
+        schema.pre('findOneAndUpdate', function (next) {
+            this._neo4j = true;
             next();
+        });
+        schema.post('findOneAndUpdate', function (doc, next) {
+            synchronize(doc,next);
         });
     };
 };
